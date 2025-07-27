@@ -1,0 +1,689 @@
+package application;
+
+import javafx.application.Application;
+import javafx.beans.property.SimpleStringProperty;
+import javafx.collections.*;
+import javafx.geometry.Insets;
+import javafx.geometry.Pos;
+import javafx.scene.Scene;
+import javafx.scene.control.*;
+import javafx.scene.control.cell.PropertyValueFactory;
+import javafx.scene.input.*;
+import javafx.scene.layout.*;
+import javafx.stage.FileChooser;
+import javafx.stage.Stage;
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+
+public class PhoneBookApp extends Application {
+    private static final String FILE_NAME = "phonebook.txt";
+    private static final String PASSWORD_FILE = "password.txt";
+    String recoveryNumber = getRecoveryNumber();
+
+
+    private final ObservableList<Map.Entry<String, String>> contacts = FXCollections.observableArrayList();
+    private final Map<String, String> contactMap = new LinkedHashMap<>();
+
+    private final TableView<Map.Entry<String, String>> tableView = new TableView<>();
+    private final TextField nameField = new TextField();
+    private final TextField numberField = new TextField();
+    private final TextField searchField = new TextField();
+
+    private final ToggleGroup searchToggleGroup = new ToggleGroup();
+    private RadioButton rbSearchBoth, rbSearchName, rbSearchNumber;
+
+    private final Deque<Runnable> undoStack = new ArrayDeque<>();
+    private final Deque<Runnable> redoStack = new ArrayDeque<>();
+
+    @Override
+    public void start(Stage primaryStage) {
+        if (!checkPassword(primaryStage)) {
+            return;
+        }
+
+        loadFromFile();
+        tableView.setItems(contacts);
+
+        // Ensure messages directory exists
+        File msgDir = new File("messages");
+        if (!msgDir.exists()) msgDir.mkdir();
+
+        TableColumn<Map.Entry<String, String>, String> nameCol = new TableColumn<>("Name");
+        nameCol.setCellValueFactory(data -> new SimpleStringProperty(data.getValue().getKey()));
+
+        TableColumn<Map.Entry<String, String>, String> numberCol = new TableColumn<>("Number");
+        numberCol.setCellValueFactory(data -> new SimpleStringProperty(data.getValue().getValue()));
+
+        tableView.getColumns().addAll(nameCol, numberCol);
+        tableView.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY);
+
+        // Buttons
+        Button addBtn = new Button("➕ Add");
+        Button updateBtn = new Button("✏ Update");
+        Button deleteBtn = new Button("🗑 Delete");
+        Button chatButton = new Button("💬 Chat");
+        Button saveExitBtn = new Button("💾 Save & Exit");
+        Button clearBtn = new Button("🧹 Clear");
+        Button exportBtn = new Button("📁 Export CSV");
+        Button exportSelectedBtn = new Button("📂 Export Selected");
+        Button undoBtn = new Button("↩ Undo");
+        Button redoBtn = new Button("↪ Redo");
+        Button clearSearchBtn = new Button("❌");
+        Button changePasswordBtn = new Button("🔑 Change Password");
+
+        // Radio buttons
+        rbSearchBoth = new RadioButton("Search Name & Number");
+        rbSearchName = new RadioButton("Search Name Only");
+        rbSearchNumber = new RadioButton("Search Number Only");
+
+        rbSearchBoth.setToggleGroup(searchToggleGroup);
+        rbSearchName.setToggleGroup(searchToggleGroup);
+        rbSearchNumber.setToggleGroup(searchToggleGroup);
+        rbSearchBoth.setSelected(true);
+
+        // Layouts
+        HBox searchModeBox = new HBox(10, rbSearchBoth, rbSearchName, rbSearchNumber);
+        searchModeBox.setPadding(new Insets(5));
+
+        HBox inputBox = new HBox(10, new Label("Name:"), nameField, new Label("Number:"), numberField, addBtn, clearBtn);
+        inputBox.setPadding(new Insets(10));
+
+        FlowPane controlBox = new FlowPane(10, 10, updateBtn, deleteBtn, chatButton, undoBtn, redoBtn, saveExitBtn, changePasswordBtn, exportBtn, exportSelectedBtn);
+        controlBox.setPadding(new Insets(10));
+
+        HBox searchBox = new HBox(5, new Label("Search:"), searchField, clearSearchBtn);
+        searchBox.setPadding(new Insets(10));
+
+        VBox layout = new VBox(5, searchBox, searchModeBox, tableView, inputBox, controlBox);
+        layout.setPadding(new Insets(10));
+
+        // Event Handlers
+        addBtn.setOnAction(e -> addContact());
+        updateBtn.setOnAction(e -> updateContact());
+        deleteBtn.setOnAction(e -> deleteContact());
+        chatButton.setOnAction(e -> {
+            Map.Entry<String, String> selected = tableView.getSelectionModel().getSelectedItem();
+            if (selected == null) {
+                showAlert("No Selection", "Please select a contact to chat with.");
+                return;
+            }
+            openChatWindow(selected.getKey());
+        });
+
+        saveExitBtn.setOnAction(e -> {
+            saveToFile();
+            primaryStage.close();
+        });
+
+        clearBtn.setOnAction(e -> {
+            nameField.clear();
+            numberField.clear();
+        });
+
+        exportBtn.setOnAction(e -> exportCSV(primaryStage, false));
+        exportSelectedBtn.setOnAction(e -> exportCSV(primaryStage, true));
+        undoBtn.setOnAction(e -> undoLastAction());
+        redoBtn.setOnAction(e -> redoLastAction());
+        clearSearchBtn.setOnAction(e -> searchField.clear());
+        changePasswordBtn.setOnAction(e -> changePassword());
+
+        searchField.textProperty().addListener((obs, oldVal, newVal) -> filterContacts(newVal));
+        searchToggleGroup.selectedToggleProperty().addListener((obs, oldVal, newVal) -> filterContacts(searchField.getText().trim()));
+
+        tableView.getSelectionModel().selectedItemProperty().addListener((obs, oldSel, newSel) -> {
+            if (newSel != null) {
+                nameField.setText(newSel.getKey());
+                numberField.setText(newSel.getValue());
+            }
+        });
+
+        tableView.setRowFactory(tv -> {
+            TableRow<Map.Entry<String, String>> row = new TableRow<>();
+            ContextMenu contextMenu = new ContextMenu();
+
+            MenuItem updateItem = new MenuItem("Update");
+            MenuItem deleteItem = new MenuItem("Delete");
+            MenuItem messageItem = new MenuItem("Message");
+
+            updateItem.setOnAction(e -> {
+                tableView.getSelectionModel().select(row.getIndex());
+                updateContact();
+            });
+
+            deleteItem.setOnAction(e -> {
+                tableView.getSelectionModel().select(row.getIndex());
+                deleteContact();
+            });
+
+            messageItem.setOnAction(e -> {
+                Map.Entry<String, String> selected = tableView.getSelectionModel().getSelectedItem();
+                if (selected != null) {
+                    openChatWindow(selected.getKey());
+                }
+            });
+
+            contextMenu.getItems().addAll(updateItem, deleteItem, messageItem);
+
+            row.setOnContextMenuRequested(e -> {
+                if (!row.isEmpty()) contextMenu.show(row, e.getScreenX(), e.getScreenY());
+            });
+
+            row.setOnMouseClicked(e -> {
+                if (e.getClickCount() == 2 && (!row.isEmpty())) {
+                    Map.Entry<String, String> rowData = row.getItem();
+                    nameField.setText(rowData.getKey());
+                    numberField.setText(rowData.getValue());
+                }
+            });
+
+            return row;
+        });
+
+        primaryStage.setTitle("Phone Book - JavaFX");
+        primaryStage.setScene(new Scene(layout, 1100, 600)); // Increased width to ensure buttons are visible
+        primaryStage.show();
+    }
+
+    private boolean checkPassword(Stage owner) {
+        File file = new File(PASSWORD_FILE);
+        String storedHash = null;
+        String recoveryNumber = getRecoveryNumber();
+
+        if (file.exists()) {
+            try {
+                storedHash = new String(Files.readAllBytes(Paths.get(PASSWORD_FILE)), StandardCharsets.UTF_8).trim();
+            } catch (IOException e) {
+                showAlert("Error", "Failed to read password file.");
+                return false;
+            }
+
+            int attempts = 3;
+            while (attempts-- > 0) {
+                Optional<String> result = showPasswordDialog("Login", "Enter Password");
+                if (result.isPresent()) {
+                    String inputPassword = result.get();
+                    String hashed = hashPassword(inputPassword);
+                    if (hashed.equals(storedHash)) {
+                        return true;
+                    } else if (attempts > 0) {
+                        showAlert("Login Failed", "Incorrect password. Attempts left: " + attempts);
+                    }
+                } else {
+                    return false; // Cancelled
+                }
+            }
+
+            Alert recoveryAlert = new Alert(Alert.AlertType.CONFIRMATION);
+            recoveryAlert.setTitle("Access Denied");
+            recoveryAlert.setHeaderText("Too many failed attempts.");
+            recoveryAlert.setContentText("Would you like to try password recovery?");
+            ButtonType recoverBtn = new ButtonType("Recover Password");
+            ButtonType exitBtn = new ButtonType("Exit", ButtonBar.ButtonData.CANCEL_CLOSE);
+            recoveryAlert.getButtonTypes().setAll(recoverBtn, exitBtn);
+
+            Optional<ButtonType> choice = recoveryAlert.showAndWait();
+            if (choice.isPresent() && choice.get() == recoverBtn) {
+                return recoverByMobile(owner, recoveryNumber);
+            }
+            return false;
+
+        } else {
+            Optional<String> result = showPasswordDialog("Set Password", "Create a New Password");
+            if (result.isPresent()) {
+                String newPassword = result.get();
+                String hashed = hashPassword(newPassword);
+                try {
+                    Files.write(Paths.get(PASSWORD_FILE), hashed.getBytes(StandardCharsets.UTF_8));
+                    return true;
+                } catch (IOException e) {
+                    showAlert("Error", "Failed to save password.");
+                }
+            }
+            return false;
+        }
+    }
+
+    private boolean recoverByMobile(Stage owner, String recoveryNumber) {
+        TextInputDialog dialog = new TextInputDialog();
+        dialog.setTitle("Recover Password");
+        dialog.setHeaderText("Enter your registered mobile number:");
+        Optional<String> input = dialog.showAndWait();
+        if (input.isPresent() && input.get().trim().equals(recoveryNumber)) {
+            Optional<String> newPass = showPasswordDialog("Set New Password", "Enter new password:");
+            if (newPass.isPresent()) {
+                String hashed = hashPassword(newPass.get());
+                try {
+                    Files.write(Paths.get(PASSWORD_FILE), hashed.getBytes(StandardCharsets.UTF_8));
+                    showAlert("Success", "Password reset successful.");
+                    return true;
+                } catch (IOException e) {
+                    showAlert("Error", "Failed to save new password.");
+                }
+            }
+        } else {
+            showAlert("Failed", "Incorrect mobile number.");
+        }
+        return false;
+    }
+
+    private Optional<String> showPasswordDialog(String title, String headerText) {
+        Dialog<String> dialog = new Dialog<>();
+        dialog.setTitle(title);
+        dialog.setHeaderText(headerText);
+
+        PasswordField passwordField = new PasswordField();
+        VBox content = new VBox(new Label("Password:"), passwordField);
+        content.setSpacing(10);
+        dialog.getDialogPane().setContent(content);
+        dialog.getDialogPane().getButtonTypes().addAll(ButtonType.OK, ButtonType.CANCEL);
+
+        dialog.setResultConverter(dialogButton -> {
+            if (dialogButton == ButtonType.OK) {
+                return passwordField.getText();
+            }
+            return null;
+        });
+
+        return dialog.showAndWait();
+    }
+
+    private void changePassword() {
+        Dialog<List<String>> dialog = new Dialog<>();
+        dialog.setTitle("Change Password");
+
+        PasswordField oldPassword = new PasswordField();
+        PasswordField newPassword = new PasswordField();
+        PasswordField confirmPassword = new PasswordField();
+
+        VBox box = new VBox(10,
+            new Label("Old Password:"), oldPassword,
+            new Label("New Password:"), newPassword,
+            new Label("Confirm New Password:"), confirmPassword
+        );
+        dialog.getDialogPane().setContent(box);
+        dialog.getDialogPane().getButtonTypes().addAll(ButtonType.OK, ButtonType.CANCEL);
+
+        dialog.setResultConverter(dialogButton -> {
+            if (dialogButton == ButtonType.OK) {
+                return Arrays.asList(oldPassword.getText(), newPassword.getText(), confirmPassword.getText());
+            }
+            return null;
+        });
+
+        Optional<List<String>> result = dialog.showAndWait();
+        if (result.isPresent()) {
+            List<String> inputs = result.get();
+            String oldPass = inputs.get(0);
+            String newPass = inputs.get(1);
+            String confirmPass = inputs.get(2);
+
+            try {
+                String storedHash = new String(Files.readAllBytes(Paths.get(PASSWORD_FILE)), StandardCharsets.UTF_8).trim();
+                if (!storedHash.equals(hashPassword(oldPass))) {
+                    showAlert("Error", "Old password is incorrect.");
+                    return;
+                }
+
+                if (!newPass.equals(confirmPass)) {
+                    showAlert("Error", "New passwords do not match.");
+                    return;
+                }
+
+                Files.write(Paths.get(PASSWORD_FILE), hashPassword(newPass).getBytes(StandardCharsets.UTF_8));
+                showAlert("Success", "Password changed successfully.");
+            } catch (IOException e) {
+                showAlert("Error", "Failed to update password.");
+            }
+        }
+    }
+
+    private String getRecoveryNumber() {
+        File file = new File("recovery.txt");
+        if (file.exists()) {
+            try {
+                String number = new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8).trim();
+                if (!number.isEmpty()) return number;
+            } catch (IOException ignored) {}
+        }
+        return "03490618976"; // Fallback default number
+    }
+
+    // All other existing methods (addContact, updateContact, deleteContact, etc.) are below.
+    // ... [wait i will also provide you those] ...
+
+// now next portion of my code
+    private void addContact() {
+        String name = nameField.getText().trim();
+        String number = numberField.getText().trim();
+        if (name.isEmpty() || number.isEmpty()) {
+            showAlert("Validation Error", "Name and number cannot be empty.");
+            return;
+        }
+       
+        if (!isValidNumber(number)) {
+            showAlert("Validation Error", "Number must contain digits, spaces, + or - only.");
+            return;
+        }
+        if (findActualName(name) != null) {
+            showAlert("Duplicate", "Contact already exists.");
+            return;
+        }
+       
+        contactMap.put(name, number);
+        refreshContacts(searchField.getText().trim());
+        undoStack.push(() -> {
+            contactMap.remove(name);
+            refreshContacts(searchField.getText().trim());
+        });
+        redoStack.clear();
+        nameField.clear();
+        numberField.clear();
+    }
+
+    private void updateContact() {
+        Map.Entry<String, String> selected = tableView.getSelectionModel().getSelectedItem();
+        if (selected == null) {
+            showAlert("No Selection", "Please select a contact to update.");
+            return;
+        }
+        String oldName = selected.getKey();
+        String oldNumber = selected.getValue();
+        String newName = nameField.getText().trim();
+        String newNumber = numberField.getText().trim();
+        if (newName.isEmpty() || newNumber.isEmpty()) {
+            showAlert("Validation Error", "Name and number cannot be empty.");
+            return;
+        }
+        if (!isValidNumber(newNumber)) {
+            showAlert("Validation Error", "Number must contain digits, spaces, + or - only.");
+            return;
+        }
+        if (!oldName.equals(newName) && contactMap.containsKey(newName)) {
+            showAlert("Duplicate", "Another contact with this name exists.");
+            return;
+        }
+        undoStack.push(() -> {
+            contactMap.remove(newName);
+            contactMap.put(oldName, oldNumber);
+            refreshContacts(searchField.getText().trim());
+        });
+        redoStack.clear();
+        contactMap.remove(oldName);
+        contactMap.put(newName, newNumber);
+        refreshContacts(searchField.getText().trim());
+        nameField.clear();
+        numberField.clear();
+    }
+
+    private void deleteContact() {
+        Map.Entry<String, String> selected = tableView.getSelectionModel().getSelectedItem();
+        if (selected == null) {
+            showAlert("No Selection", "Please select a contact to delete.");
+            return;
+        }
+        String removedName = selected.getKey();
+        String removedNumber = selected.getValue();
+        undoStack.push(() -> {
+            contactMap.put(removedName, removedNumber);
+            refreshContacts(searchField.getText().trim());
+        });
+        redoStack.clear();
+        contactMap.remove(removedName);
+        refreshContacts(searchField.getText().trim());
+        nameField.clear();
+        numberField.clear();
+    }
+
+    private void undoLastAction() {
+        if (undoStack.isEmpty()) {
+            showAlert("Undo", "Nothing to undo.");
+            return;
+        }
+        Runnable action = undoStack.pop();
+        redoStack.push(snapshot());
+        action.run();
+    }
+
+    private void redoLastAction() {
+        if (redoStack.isEmpty()) {
+            showAlert("Redo", "Nothing to redo.");
+            return;
+        }
+        Runnable action = redoStack.pop();
+        undoStack.push(snapshot());
+        action.run();
+    }
+
+    private Runnable snapshot() {
+        Map<String, String> copy = new LinkedHashMap<>(contactMap);
+        return () -> {
+            contactMap.clear();
+            contactMap.putAll(copy);
+            refreshContacts(searchField.getText().trim());
+        };
+    }
+
+    private void refreshContacts(String filter) {
+        contacts.clear();
+        if (filter.isEmpty()) {
+            contactMap.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey(String.CASE_INSENSITIVE_ORDER))
+                .forEachOrdered(contacts::add);
+            return;
+        }
+        String[] keywords = filter.toLowerCase().split("\\s+");
+        boolean searchName = rbSearchName.isSelected();
+        boolean searchNumber = rbSearchNumber.isSelected();
+        boolean searchBoth = rbSearchBoth.isSelected();
+        contactMap.entrySet().stream()
+            .sorted(Map.Entry.comparingByKey(String.CASE_INSENSITIVE_ORDER))
+            .filter(entry -> {
+                String name = entry.getKey().toLowerCase();
+                String number = entry.getValue().toLowerCase();
+                for (String keyword : keywords) {
+                    boolean nameContains = name.contains(keyword);
+                    boolean numberContains = number.contains(keyword);
+                    if (searchName && !nameContains) return false;
+                    if (searchNumber && !numberContains) return false;
+                    if (searchBoth && !(nameContains || numberContains)) return false;
+                }
+                return true;
+            })
+            .forEachOrdered(contacts::add);
+    }
+
+    private void filterContacts(String query) {
+        refreshContacts(query.trim());
+    }
+
+    private void loadFromFile() {
+        File file = new File(FILE_NAME);
+        if (!file.exists()) return;
+        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+            contactMap.clear();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String[] parts = line.split(",", 2);
+                if (parts.length == 2) contactMap.put(parts[0].trim(), parts[1].trim());
+            }
+            refreshContacts(searchField.getText().trim());
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+   
+    private void openChatWindow(String contactName) {
+        Stage chatStage = new Stage();
+        chatStage.setTitle("Chat with " + contactName);
+
+        // === Chat Display Area ===
+        TextArea chatArea = new TextArea();
+        chatArea.setEditable(false);
+        chatArea.setWrapText(true);
+        chatArea.setPrefHeight(400);
+
+        // === Message Input ===
+        TextField messageField = new TextField();
+        messageField.setPromptText("Type a message...");
+        messageField.setPrefWidth(300);
+
+        // === Send Button ===
+        Button sendButton = new Button("Send");
+        sendButton.setPrefWidth(70);
+
+        // === Layout for Input ===
+        HBox inputBox = new HBox(10, messageField, sendButton);
+        inputBox.setAlignment(Pos.CENTER_RIGHT);
+
+        VBox root = new VBox(10, chatArea, inputBox);
+        root.setPadding(new Insets(10));
+
+        // === Use Logged-in Username ===
+        String currentUser = "you"; // ← Replace with your actual logged-in username variable if available
+        String fileName = "chat_" + currentUser + "_" + contactName + ".txt";
+        File chatFile = new File(fileName);
+
+        // === Load Chat History ===
+        if (chatFile.exists()) {
+            try {
+                String history = new String(Files.readAllBytes(chatFile.toPath()));
+                chatArea.setText(history);
+            } catch (IOException e) {
+                chatArea.setText("Error loading chat history.");
+            }
+        }
+
+        // === Send Button Action ===
+        sendButton.setOnAction(e -> {
+            String message = messageField.getText().trim();
+            if (!message.isEmpty()) {
+                String time = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm"));
+                String formatted = currentUser + " (" + time + "): " + message + "\n";
+
+                chatArea.appendText(formatted);
+
+                try (FileWriter writer = new FileWriter(chatFile, true)) {
+                    writer.write(formatted);
+                } catch (IOException ex) {
+                    chatArea.appendText("Error saving message.\n");
+                }
+
+                messageField.clear();
+            }
+        });
+
+        // === Pressing Enter Sends Message ===
+        messageField.setOnAction(sendButton.getOnAction());
+
+        // === Show Window ===
+        Scene scene = new Scene(root, 400, 500);
+        chatStage.setScene(scene);
+        chatStage.show();
+    }
+
+
+    private void saveMessage(String contactName, String sender, String message) {
+        File file = new File("messages", contactName + ".txt");
+        try (FileWriter fw = new FileWriter(file, true)) {
+            fw.write(sender + ": " + message + "\n");
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void loadMessages(final String contactName, final TextArea chatArea) {
+        File file = new File("messages", contactName + ".txt");
+        if (file.exists()) {
+            try {
+                String content = new String(Files.readAllBytes(file.toPath()));
+                chatArea.setText(content);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    private void saveToFile() {
+        try (PrintWriter writer = new PrintWriter(new FileWriter(FILE_NAME))) {
+            for (Map.Entry<String, String> entry : contactMap.entrySet()) {
+                writer.println(entry.getKey() + "," + entry.getValue());
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void exportCSV(Stage stage, boolean selectedOnly) {
+        FileChooser fileChooser = new FileChooser();
+        fileChooser.setTitle("Export Contacts");
+        fileChooser.getExtensionFilters().add(new FileChooser.ExtensionFilter("CSV Files", "*.csv"));
+        File file = fileChooser.showSaveDialog(stage);
+        if (file == null) return;
+
+        try (PrintWriter writer = new PrintWriter(file)) {
+            writer.println("Name,Number");
+            List<Map.Entry<String, String>> exportList = selectedOnly
+                    ? new ArrayList<>(tableView.getSelectionModel().getSelectedItems())
+                    : new ArrayList<>(contacts);
+            for (Map.Entry<String, String> entry : exportList) {
+                String escapedName = escapeCSV(entry.getKey());
+                String escapedNumber = escapeCSV(entry.getValue());
+                writer.println(escapedName + "," + escapedNumber);
+            }
+            showAlert("Export Successful", "Contacts exported successfully.");
+        } catch (IOException e) {
+            showAlert("Export Failed", "An error occurred while exporting contacts.");
+            e.printStackTrace();
+        }
+    }
+
+    private String escapeCSV(String value) {
+        if (value.contains(",") || value.contains("\"") || value.contains("\n")) {
+            value = value.replace("\"", "\"\""); // Escape double quotes by doubling them
+            return "\"" + value + "\""; // Wrap in double quotes
+        }
+        return value;
+    }
+
+
+    private String findActualName(String name) {
+        for (String key : contactMap.keySet()) {
+            if (key.equalsIgnoreCase(name)) return key;
+        }
+        return null;
+    }
+
+    private boolean isValidNumber(String number) {
+        return number.matches("[0-9+\\-\\s]+");
+    }
+
+    private String hashPassword(String password) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(password.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hexString = new StringBuilder();
+            for (byte b : hash) {
+                hexString.append(String.format("%02x", b));
+            }
+            return hexString.toString();
+        } catch (NoSuchAlgorithmException e) {
+            return null;
+        }
+    }
+
+    private void showAlert(String title, String message) {
+        Alert alert = new Alert(Alert.AlertType.INFORMATION);
+        alert.setTitle(title);
+        alert.setHeaderText(null);
+        alert.setContentText(message);
+        alert.showAndWait();
+    }
+}
